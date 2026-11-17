@@ -48,6 +48,7 @@ M_DEC = {"K1": 3, "K2": 3, "CYL": 3, "AXIS": 2, "J0": 3, "J45": 3}
 CYL_CUTOFF = 0.75            # AXIS 분석 대상: |Predicate CYL| ≥ 0.75 D
 ALL_GROUP = "전체"
 ALL_EYES = "All eyes"         # Eye 컬럼이 없는 데이터
+STUDY_EYE = "Study eye"       # 대상자별 지정 눈(OD 또는 OS 1안)
 
 # PG — Agreement (LoA 95% CI 기준, ±)
 BA_PG = {"K1": 1.0, "K2": 1.0, "CYL": 0.5, "AXIS": 15.0}
@@ -225,14 +226,45 @@ def load_group(raw, fname):
     g.columns = [str(c).strip().upper() for c in g.columns]
     if "PID" not in g.columns:
         raise ValueError("그룹 파일에 PID 컬럼이 없습니다.")
-    gcol = "GROUP" if "GROUP" in g.columns else next((c for c in g.columns if c not in ("PID", "EYE")), None)
+    gcol = "GROUP" if "GROUP" in g.columns else next(
+        (c for c in g.columns if c not in ("PID", "EYE") and _study_col([c]) is None), None)
     if gcol is None:
-        raise ValueError("그룹 파일에 GROUP 컬럼이 없습니다.")
+        return None     # GROUP 없음 (Study eye 정보만 있는 파일)
     g = g[g["PID"].notna() & g[gcol].notna()].copy()
     out = pd.DataFrame({"PID_KEY": g["PID"].map(norm_pid), "GROUP": g[gcol].astype(str).str.strip()})
     if "EYE" in g.columns:
         out["EYE"] = g["EYE"].astype(str).str.strip().str.upper().map(lambda v: EYE_MAP.get(v, v))
     return out.drop_duplicates()
+
+
+def _study_col(cols):
+    """'STUDY_EYE', 'STUDY EYE', 'STUDYEYE' 등 Study eye 컬럼 이름 찾기"""
+    return next((c for c in cols if re.sub(r"[^A-Z]", "", str(c).upper()) in ("STUDYEYE", "STUDY")), None)
+
+
+@st.cache_data(show_spinner=False)
+def load_study_eye(raw, fname):
+    """PID별 Study eye(OD/OS) → DataFrame[PID_KEY, STUDY_EYE]. 컬럼이 없으면 None"""
+    s = _read_bytes(raw, fname)
+    s.columns = [str(c).strip().upper() for c in s.columns]
+    scol = _study_col(s.columns)
+    if "PID" not in s.columns or scol is None:
+        return None
+    s = s[s["PID"].notna() & s[scol].notna()]
+    out = pd.DataFrame({
+        "PID_KEY": s["PID"].map(norm_pid),
+        "STUDY_EYE": s[scol].astype(str).str.strip().str.upper().map(lambda v: EYE_MAP.get(v, v)),
+    })
+    out = out[out["STUDY_EYE"].isin(["OD", "OS"])]
+    return out.drop_duplicates(subset=["PID_KEY"], keep="first")
+
+
+def attach_study(df, sdf):
+    df = df.drop(columns=["STUDY_EYE"], errors="ignore")
+    if sdf is None:
+        df["STUDY_EYE"] = np.nan
+        return df
+    return df.merge(sdf, on="PID_KEY", how="left")
 
 
 def attach_group(df, gdf):
@@ -301,6 +333,8 @@ def subset_df(df, eye, group):
     d = df
     if eye in ("OD", "OS"):
         d = d[d["EYE"] == eye]
+    elif eye == STUDY_EYE:
+        d = d[d["EYE"] == d["STUDY_EYE"]]
     if group != ALL_GROUP:
         d = d[d["GROUP"] == group]
     return d
@@ -629,7 +663,7 @@ st.markdown("### Test vs Predicate — Agreement & Precision Analysis")
 st.divider()
 
 st.markdown('<div class="section-title">Data Upload</div>', unsafe_allow_html=True)
-cu1, cu2, cu3, cu4 = st.columns(4)
+cu1, cu2, cu3, cu4, cu5 = st.columns(5)
 with cu1:
     test_file = st.file_uploader("📂 Test (시험기기)", type=["csv", "xlsx"])
 with cu2:
@@ -638,7 +672,10 @@ with cu3:
     pred2_file = st.file_uploader("📂 Predicate 2 (산점도용, 선택)", type=["csv", "xlsx"])
 with cu4:
     group_file = st.file_uploader("📂 그룹 정보 (선택, PID·GROUP)", type=["csv", "xlsx"])
+with cu5:
+    study_file = st.file_uploader("📂 Study eye 정보 (선택, PID·STUDY_EYE)", type=["csv", "xlsx"])
 st.caption("기기 파일 필수 컬럼: PID, SEQ, EYE(OD/OS), K1, K2, CYL, AXIS  ·  그룹 파일: PID, GROUP (EYE 컬럼이 있으면 눈별 그룹 적용)  ·  "
+           "Study eye: PID, STUDY_EYE(OD/OS) — 별도 파일 또는 그룹 파일에 STUDY_EYE 컬럼으로 추가  ·  "
            "PID는 대소문자·하이픈·앞자리 0을 무시하고 매칭합니다 (S001 = s-001).")
 st.divider()
 
@@ -673,7 +710,7 @@ prec_ex = parse_csv_list(st.sidebar.text_input("Precision 제외 PID", value="",
 
 # ── 데이터 로드 ─────────────────────────────────────────────
 data_ready = bool(test_file and pred_file)
-group_df, subsets = None, []
+group_df, study_df, subsets = None, None, []
 if data_ready:
     try:
         test_df = load_device(test_file.getvalue(), test_file.name, normalize, off_t)
@@ -685,19 +722,32 @@ if data_ready:
 if data_ready and group_file:
     try:
         group_df = load_group(group_file.getvalue(), group_file.name)
+        study_df = load_study_eye(group_file.getvalue(), group_file.name)   # 그룹 파일의 STUDY_EYE 컬럼
     except Exception as e:
         st.error(f"그룹 파일 오류: {e}")
         group_df = None
 
+if data_ready and study_file:
+    try:
+        study_df = load_study_eye(study_file.getvalue(), study_file.name)  # 별도 파일이 우선
+        if study_df is None:
+            st.error("Study eye 파일에 PID / STUDY_EYE 컬럼이 없습니다.")
+    except Exception as e:
+        st.error(f"Study eye 파일 오류: {e}")
+        study_df = None
+
 if data_ready:
-    test_df = attach_group(test_df, group_df)
-    pred_df = attach_group(pred_df, group_df)
+    test_df = attach_study(attach_group(test_df, group_df), study_df)
+    pred_df = attach_study(attach_group(pred_df, group_df), study_df)
 
     has_eye = bool({"OD", "OS"} & set(test_df["EYE"]))
     eye_options = ["OD+OS", "OD", "OS"] if has_eye else [ALL_EYES]
+    if has_eye and study_df is not None:
+        eye_options.append(STUDY_EYE)
     st.sidebar.markdown("### 👁️ 분석 단위")
     eye_sel = st.sidebar.multiselect("Eye", eye_options, default=eye_options,
-                                     help="OD+OS: 양안을 독립된 눈으로 합산하여 분석")
+                                     help="OD+OS: 양안을 독립된 눈으로 합산하여 분석 · "
+                                          "Study eye: 대상자별로 지정된 눈(OD 또는 OS) 1안만 분석")
     groups = sorted(group_df["GROUP"].unique(), key=natural_key) if group_df is not None else []
     grp_options = [ALL_GROUP] + groups
     grp_sel = st.sidebar.multiselect("Group", grp_options, default=grp_options) if groups else [ALL_GROUP]
@@ -718,6 +768,13 @@ if data_ready:
         no_grp = sorted(set(test_df.loc[test_df["GROUP"].isna(), "PID"]), key=natural_key)
         if no_grp:
             info.append(f"그룹 정보가 없는 PID {len(no_grp)}명 ('{ALL_GROUP}'에만 포함): {', '.join(no_grp[:20])}{' …' if len(no_grp) > 20 else ''}")
+    if study_df is not None and has_eye:
+        se = test_df.drop_duplicates("PID_KEY")
+        n_od, n_os = (se["STUDY_EYE"] == "OD").sum(), (se["STUDY_EYE"] == "OS").sum()
+        info.append(f"Study eye: OD {n_od}명 · OS {n_os}명")
+        no_se = sorted(set(se.loc[se["STUDY_EYE"].isna(), "PID"]), key=natural_key)
+        if no_se:
+            info.append(f"Study eye 정보가 없는 PID {len(no_se)}명 (Study eye 분석에서 제외): {', '.join(no_se[:20])}{' …' if len(no_se) > 20 else ''}")
     st.caption("  \n".join(info))
 
     gap = axis_gap_check(test_df, pred_df)
@@ -739,7 +796,7 @@ with tab_ba:
         st.info("👆 Test와 Predicate 파일을 업로드하면 분석이 시작됩니다.")
     elif subsets:
         merged = build_agreement(exclude(test_df, ba_ex), exclude(pred_df, ba_ex), method)
-        merged = attach_group(merged, group_df)
+        merged = attach_study(attach_group(merged, group_df), study_df)
         avail = [m for m in MEASURES if all(c in merged.columns for c in PAIR[m])]
         ba_sel = st.sidebar.multiselect("📊 Agreement 분석 항목", avail, default=avail,
                                         format_func=lambda m: M_LABEL[m], key="ba_sel")
@@ -1028,7 +1085,8 @@ with tab_sc:
         devices = {DEV_T: test_df, DEV_P: pred_df}
         if pred2_file:
             try:
-                devices[DEV_P2] = attach_group(load_device(pred2_file.getvalue(), pred2_file.name, normalize, off_p2), group_df)
+                devices[DEV_P2] = attach_study(attach_group(
+                    load_device(pred2_file.getvalue(), pred2_file.name, normalize, off_p2), group_df), study_df)
             except Exception as e:
                 st.error(f"Predicate 2 로드 오류: {e}")
 
@@ -1038,7 +1096,10 @@ with tab_sc:
                                   format_func=lambda m: f"{M_LABEL[m]} [{M_UNIT[m]}]", key="sc_var")
         with c2:
             eyes_av = sorted(set(test_df["EYE"]))
-            sc_eye = st.selectbox("Eye", (["OD+OS"] + eyes_av) if len(eyes_av) > 1 else eyes_av, key="sc_eye")
+            sc_eye_opts = (["OD+OS"] + eyes_av) if len(eyes_av) > 1 else eyes_av
+            if study_df is not None and len(eyes_av) > 1:
+                sc_eye_opts.append(STUDY_EYE)
+            sc_eye = st.selectbox("Eye", sc_eye_opts, key="sc_eye")
         with c3:
             sc_grp = st.selectbox("Group", [ALL_GROUP] + (sorted(group_df["GROUP"].unique(), key=natural_key)
                                                           if group_df is not None else []), key="sc_grp")
@@ -1050,7 +1111,7 @@ with tab_sc:
             legend_loc = st.selectbox("범례 위치", ["upper right", "upper left", "lower right", "lower left",
                                                   "upper center", "lower center", "outside right"], key="sc_loc")
 
-        subs = {k: subset_df(v, sc_eye if sc_eye != "OD+OS" else "OD+OS", sc_grp) for k, v in devices.items()}
+        subs = {k: subset_df(v, sc_eye, sc_grp) for k, v in devices.items()}
         base = subs[DEV_T]
         units = sorted({(p, k, e) for p, k, e in zip(base["PID"], base["PID_KEY"], base["EYE"])},
                        key=lambda u: (natural_key(u[1]), u[2]))
@@ -1062,10 +1123,14 @@ with tab_sc:
             st.warning("표시할 데이터가 없습니다.")
         else:
             fig, ax = plt.subplots(figsize=(max(6.5, 0.28 * len(units) + 1.5), 3.6))
-            offs = np.linspace(-0.22, 0.22, len(devices)) if len(devices) > 1 else [0]
+            # 대상자별 세로 기준선 + 가로 보조 눈금선 (값 읽기용)
+            ax.set_axisbelow(True)
+            ax.grid(axis="x", color="0.85", lw=0.6, ls="-", zorder=0)
+            ax.grid(axis="y", which="major", color="0.85", lw=0.5, ls=":", zorder=0)
             vals = []
             handles = []
-            for (dev, d), off in zip(subs.items(), offs):
+            for dev, d in subs.items():
+                off = 0   # 모든 기기를 같은 x 위치(한 줄)에 표기
                 if sc_var not in d.columns:
                     continue
                 col = DEV_COLOR.get(dev, "0.4")
