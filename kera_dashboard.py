@@ -276,8 +276,46 @@ def attach_group(df, gdf):
     return df.merge(gdf.drop_duplicates(subset=keys), on=keys, how="left")
 
 
-def exclude(df, keys):
-    return df[~df["PID_KEY"].isin(keys)] if keys else df
+EX_ALL = "전체"
+EX_COLS = ["Device", "PID", "EYE", "SEQ", "사유"]
+
+
+def clean_exclusions(ex):
+    """제외 목록 정리: PID가 비어 있는 행 제거, 빈 칸은 '전체'로 처리"""
+    if ex is None or len(ex) == 0:
+        return pd.DataFrame(columns=EX_COLS)
+    ex = ex.copy()
+    for c in EX_COLS:
+        if c not in ex.columns:
+            ex[c] = ""
+    ex = ex[ex["PID"].notna() & (ex["PID"].astype(str).str.strip() != "")]
+    for c in ["Device", "EYE", "SEQ"]:
+        ex[c] = ex[c].fillna(EX_ALL).astype(str).str.strip().replace({"": EX_ALL, "nan": EX_ALL, "None": EX_ALL})
+    ex["SEQ"] = ex["SEQ"].str.replace(r"\.0$", "", regex=True)
+    ex["사유"] = ex["사유"].fillna("").astype(str)
+    return ex[EX_COLS].reset_index(drop=True)
+
+
+def exclusion_mask(df, dev, ex):
+    """dev 기기 데이터에서 제외 대상 행 = True"""
+    mask = pd.Series(False, index=df.index)
+    if ex is None or ex.empty:
+        return mask
+    for _, r in ex[ex["Device"].isin([dev, EX_ALL])].iterrows():
+        m = df["PID_KEY"] == norm_pid(r["PID"])
+        if r["EYE"] != EX_ALL:
+            m &= df["EYE"] == EYE_MAP.get(str(r["EYE"]).upper(), str(r["EYE"]).upper())
+        if r["SEQ"] != EX_ALL:
+            try:
+                m &= df["SEQ"] == float(r["SEQ"])
+            except ValueError:
+                continue
+        mask |= m
+    return mask
+
+
+def apply_exclusion(df, dev, ex):
+    return df[~exclusion_mask(df, dev, ex)].reset_index(drop=True)
 
 
 def circ_mean_axis(a):
@@ -703,11 +741,6 @@ FIG_DPI = st.sidebar.select_slider("해상도 (dpi)", options=[300, 600, 1200], 
 SHOW_CI = st.sidebar.checkbox("BA plot: 95% CI 음영 표시", value=True)
 EYE_MARKER = st.sidebar.checkbox("BA plot: OD(●)/OS(○) 마커 구분", value=True)
 
-st.sidebar.markdown("### 🚫 분석에서 제외할 PID")
-st.sidebar.caption("쉼표로 구분 (예: s-001, s-015)")
-ba_ex = parse_csv_list(st.sidebar.text_input("Agreement 제외 PID", value="", key="ba_ex"))
-prec_ex = parse_csv_list(st.sidebar.text_input("Precision 제외 PID", value="", key="prec_ex"))
-
 # ── 데이터 로드 ─────────────────────────────────────────────
 data_ready = bool(test_file and pred_file)
 group_df, study_df, subsets = None, None, []
@@ -736,7 +769,49 @@ if data_ready and study_file:
         st.error(f"Study eye 파일 오류: {e}")
         study_df = None
 
+excl_df = pd.DataFrame(columns=EX_COLS)
 if data_ready:
+    # ── 개별 측정값 제외 (Agreement·Precision·산점도 공통) ──
+    with st.expander("🚫 측정값 제외 — 기기·PID·Eye·SEQ 단위 (Agreement·Precision·산점도 공통 적용)", expanded=False):
+        st.caption("행을 추가해 제외할 측정값을 지정하세요. Device·EYE·SEQ를 '전체'로 두면 해당 범위의 측정값을 모두 제외합니다 "
+                   "(예: SEQ=전체 → 그 눈의 측정값 전부). 첫 번째 측정값 비교에서 SEQ 1을 제외하면 남은 측정값 중 가장 앞 SEQ를 사용합니다.")
+        ex_file = st.file_uploader("📂 제외 목록 CSV 불러오기 (선택)", type=["csv", "xlsx"], key="ex_file")
+        init = pd.DataFrame(columns=EX_COLS)
+        if ex_file is not None:
+            try:
+                tmp = _read_bytes(ex_file.getvalue(), ex_file.name)
+                tmp.columns = [str(c).strip() for c in tmp.columns]
+                tmp = tmp.rename(columns={c: c.upper() for c in tmp.columns if c.upper() in ("PID", "EYE", "SEQ")})
+                tmp = tmp.rename(columns={c: "Device" for c in tmp.columns if c.upper() == "DEVICE"})
+                init = clean_exclusions(tmp)
+            except Exception as e:
+                st.error(f"제외 목록 파일 오류: {e}")
+        all_pids = sorted(set(test_df["PID"]) | set(pred_df["PID"]), key=natural_key)
+        all_eyes = sorted(set(test_df["EYE"]) | set(pred_df["EYE"]))
+        all_seqs = sorted({int(s) for s in pd.concat([test_df["SEQ"], pred_df["SEQ"]]).dropna()})
+        dev_opts = [EX_ALL, DEV_T, DEV_P] + ([DEV_P2] if pred2_file else [])
+        init = init.astype(str)
+        excl_edit = st.data_editor(
+            init, num_rows="dynamic", use_container_width=True, hide_index=True,
+            key=f"ex_editor_{ex_file.name if ex_file else 'none'}",
+            column_config={
+                "Device": st.column_config.SelectboxColumn("Device", options=dev_opts, default=EX_ALL, required=True),
+                "PID": st.column_config.SelectboxColumn("PID", options=sorted(set(all_pids) | set(init["PID"]), key=natural_key), required=True),
+                "EYE": st.column_config.SelectboxColumn("EYE", options=[EX_ALL] + all_eyes, default=EX_ALL, required=True),
+                "SEQ": st.column_config.SelectboxColumn("SEQ", options=[EX_ALL] + [str(s) for s in all_seqs], default=EX_ALL, required=True),
+                "사유": st.column_config.TextColumn("사유 (선택)"),
+            })
+        excl_df = clean_exclusions(excl_edit)
+
+    n_t = int(exclusion_mask(test_df, DEV_T, excl_df).sum())
+    n_p = int(exclusion_mask(pred_df, DEV_P, excl_df).sum())
+    if not excl_df.empty:
+        st.info(f"🚫 제외된 측정값: Test {n_t}건 · Predicate {n_p}건 (제외 규칙 {len(excl_df)}개)")
+        st.download_button("⬇️ 제외 목록 CSV 저장", excl_df.to_csv(index=False).encode("utf-8-sig"),
+                           "Exclusion_list.csv", "text/csv", key="ex_dl")
+    test_df = apply_exclusion(test_df, DEV_T, excl_df)
+    pred_df = apply_exclusion(pred_df, DEV_P, excl_df)
+
     test_df = attach_study(attach_group(test_df, group_df), study_df)
     pred_df = attach_study(attach_group(pred_df, group_df), study_df)
 
@@ -795,7 +870,7 @@ with tab_ba:
     if not data_ready:
         st.info("👆 Test와 Predicate 파일을 업로드하면 분석이 시작됩니다.")
     elif subsets:
-        merged = build_agreement(exclude(test_df, ba_ex), exclude(pred_df, ba_ex), method)
+        merged = build_agreement(test_df, pred_df, method)
         merged = attach_study(attach_group(merged, group_df), study_df)
         avail = [m for m in MEASURES if all(c in merged.columns for c in PAIR[m])]
         ba_sel = st.sidebar.multiselect("📊 Agreement 분석 항목", avail, default=avail,
@@ -969,7 +1044,7 @@ with tab_prec:
         if not prec_sel:
             st.warning("사이드바에서 Precision 분석 항목을 하나 이상 선택해주세요.")
         else:
-            t_p, p_p = exclude(test_df, prec_ex), exclude(pred_df, prec_ex)
+            t_p, p_p = test_df, pred_df
             prec_store, all_rows = {}, []
             with st.spinner("🔄 Precision 분석 실행 중..."):
                 for e, g in subsets:
@@ -1085,8 +1160,9 @@ with tab_sc:
         devices = {DEV_T: test_df, DEV_P: pred_df}
         if pred2_file:
             try:
-                devices[DEV_P2] = attach_study(attach_group(
-                    load_device(pred2_file.getvalue(), pred2_file.name, normalize, off_p2), group_df), study_df)
+                p2 = load_device(pred2_file.getvalue(), pred2_file.name, normalize, off_p2)
+                p2 = apply_exclusion(p2, DEV_P2, excl_df)
+                devices[DEV_P2] = attach_study(attach_group(p2, group_df), study_df)
             except Exception as e:
                 st.error(f"Predicate 2 로드 오류: {e}")
 
